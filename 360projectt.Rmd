@@ -1,0 +1,2156 @@
+---
+title: "Untitled"
+author: "Emir Şener"
+date: "2024-05-10"
+output: html_document
+---
+
+```{r}
+require(base)
+require(data.table)
+require(datasets)
+require(dplyr)
+require(forecast)
+require(GGally)
+require(ggplot2)
+require(ggstats)
+require(graphics)
+require(grDevices)
+require(lubridate)
+require(methods)
+require(readr)
+require(stats)
+require(utils)
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(ggcorrplot)
+library(readr)
+library(tidyr)
+library(Rcpp)
+library(zoo)
+require(rpart)
+require(rattle)
+library(openxlsx)
+
+weather_info <- read_csv("processed_weather.csv", 
+    col_types = cols(date = col_date(format = "%Y-%m-%d"), 
+        hour = col_time(format = "%H")))
+```
+
+```{r}
+accu <- function(actual, forecast) {
+  n <- length(actual)
+  error <- actual - forecast
+  mean_val <- mean(actual)
+  sd_val <- sd(actual)
+  CV <- sd_val / mean_val
+  FBias <- sum(error) / sum(actual)
+  MAPE <- sum(abs(error / actual)) / n
+  RMSE <- sqrt(sum(error^2) / n)
+  MAD <- sum(abs(error)) / n
+  MADP <- sum(abs(error)) / sum(abs(actual))
+  WMAPE <- MAD / mean_val
+  result <- data.frame(n, mean_val, sd_val, CV, FBias, MAPE, RMSE, MAD, MADP, WMAPE)
+  return(result)
+}
+```
+
+```{r}
+weather_info$location <- paste(weather_info$lat, weather_info$lon, sep = "_" )
+setDT(weather_info)
+weather_wide = dcast(weather_info, date + hour ~ location, value.var = c("dswrf_surface", "tcdc_low.cloud.layer","tcdc_middle.cloud.layer","tcdc_high.cloud.layer","tcdc_entire.atmosphere","uswrf_top_of_atmosphere","csnow_surface","dlwrf_surface","uswrf_surface","tmp_surface"))
+print(weather_wide)
+```
+
+```{r}
+production <- read_csv("production.csv", 
+    col_types = cols(date = col_date(format = "%Y-%m-%d"), 
+        hour = col_time(format = "%H")))
+setDT(production)
+tail(production, 72)
+```
+
+```{r}
+production$datetime <- as.POSIXct(paste(production$date,production$hour), format = "%Y-%m-%d %H:%M:%S")
+production <- production[datetime >= as.POSIXct('2022-01-01 04:00:00', format = "%Y-%m-%d %H:%M:%S")]
+production <- unique(production)
+production <- production %>%
+  dplyr::select(-hour, -date)
+
+weather_info$datetime <- as.POSIXct(paste(weather_info$date,weather_info$hour), format = "%Y-%m-%d %H:%M:%S")
+weather_info <- weather_info[datetime >= as.POSIXct('2022-01-01 04:00:00', format = "%Y-%m-%d %H:%M:%S")]
+weather_info <- unique(weather_info)
+
+datetime_info = weather_info %>%
+  select(datetime)
+
+datetime_info <- unique(datetime_info)
+print(datetime_info)
+
+weather_info <- weather_info %>%
+  dplyr::select(-hour, -date, -lat, -lon, -location, -datetime)
+
+ggplot(production, aes(x = datetime , y =production)) +
+  geom_line()
+
+acf(production$production, 365)
+
+tail(production, 120)
+print(weather_info)
+```
+
+```{r}
+daily_series <- production %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarize(daily_prod = sum(production))
+
+print(daily_series)
+
+setDT(daily_series)
+ggplot(daily_series, aes(x = date , y = daily_prod)) +
+  geom_line()
+acf(daily_series$daily_prod,100)
+```
+
+```{r}
+ggplot(daily_series[1:365], aes(x = date, y = daily_prod)) + geom_line()
+```
+
+```{r}
+calculate_weights <- function(data_point, grid_points) {
+  weights <- vector()
+  for (i in 1:length(grid_points)) {
+    distance <- sum((grid_points[[i]] - data_point)^2)
+    inv_distance <- 1 / distance
+    weights <- c(weights, inv_distance)
+  }
+  total_weight <- sum(weights)
+  weights <- weights / total_weight
+  return(weights)
+}
+
+data_point <- c(38.29, 34.97)
+grid_points <- list(
+  c(37.75, 34.5), c(37.75, 34.75), c(37.75, 35), c(37.75, 35.25), c(37.75, 35.5),
+  c(38, 34.5), c(38, 34.75), c(38, 35), c(38, 35.25), c(38, 35.5),
+  c(38.25, 34.5), c(38.25, 34.75), c(38.25, 35), c(38.25, 35.25), c(38.25, 35.5),
+  c(38.5, 34.5), c(38.5, 34.75), c(38.5, 35), c(38.5, 35.25), c(38.5, 35.5),
+  c(38.75, 34.5), c(38.75, 34.75), c(38.75, 35), c(38.75, 35.25), c(38.75, 35.5)
+)
+```
+
+```{r}
+weights <- calculate_weights(data_point, grid_points)
+
+weather_info_weighted <- data.frame(matrix(0, nrow = nrow(weather_wide[, -(1:2)]), ncol = 10))
+colnames(weather_info_weighted) <- paste0("weighted_group_", 1:10)
+
+for (k in 1:10) {
+  weighted_sum <- numeric(nrow(weather_wide[, -(1:2)]))
+  start_col <- (k - 1) * 25 + 1
+  end_col <- start_col + 24
+  
+  for (j in start_col:end_col) {
+    col_name <- colnames(weather_wide[, -(1:2)])[j]
+    weighted_sum <- weighted_sum + weather_wide[, -(1:2)][[col_name]] * weights[(j - start_col + 1)]
+  }
+  
+  weather_info_weighted[, k] <- weighted_sum
+}
+
+colnames(weather_info_weighted) <- c("dswrf_surface", "tdc_low.cloud.layer","tdc_middle.cloud.layer","tdc_high.cloud.layer","tdc_entire.atmosphere","uswrf_top_of_atmosphere","csnow_surface","dlwrf_surface","uswrf_surface","tmp_surface")
+
+weather_info_weighted <- cbind(datetime_info, weather_info_weighted)
+tail(weather_info_weighted, 100)
+```
+
+```{r}
+fill_na_with_mean <- function(vec) {
+  na_indices <- which(is.na(vec))
+  
+  for (i in na_indices) {
+    prev_value <- vec[i - 1]
+    next_value <- vec[i + 1]
+    
+    if (!is.na(prev_value) && !is.na(next_value)) {
+      vec[i] <- (prev_value + next_value) / 2
+    }
+  }
+  
+  return(vec)
+}
+
+weather_info_weighted$uswrf_top_of_atmosphere <- fill_na_with_mean(weather_info_weighted$uswrf_top_of_atmosphere)
+weather_info_weighted$uswrf_surface <- fill_na_with_mean(weather_info_weighted$uswrf_surface)
+weather_info_weighted$tdc_high.cloud.layer <- fill_na_with_mean(weather_info_weighted$tdc_high.cloud.layer)
+weather_info_weighted$tdc_entire.atmosphere <- fill_na_with_mean(weather_info_weighted$tdc_entire.atmosphere)
+weather_info_weighted$csnow_surface <- fill_na_with_mean(weather_info_weighted$csnow_surface)
+weather_info_weighted$tmp_surface <- fill_na_with_mean(weather_info_weighted$tmp_surface)
+weather_info_weighted$dswrf_surface <- fill_na_with_mean(weather_info_weighted$dswrf_surface)
+weather_info_weighted$tdc_low.cloud.layer <- fill_na_with_mean(weather_info_weighted$tdc_low.cloud.layer)
+weather_info_weighted$tdc_middle.cloud.layer <- fill_na_with_mean(weather_info_weighted$tdc_middle.cloud.layer)
+weather_info_weighted$dlwrf_surface <- fill_na_with_mean(weather_info_weighted$dlwrf_surface)
+
+print(weather_info_weighted)
+```
+
+```{r}
+find_na <- function(data) {
+  na_indices <- which(is.na(data), arr.ind = TRUE)
+  return(na_indices)
+}
+
+na_indices <- find_na(weather_info_weighted)
+
+print(na_indices)
+```
+
+```{r}
+ggplot(production,aes(x=datetime,y=production))+geom_line()+theme(axis.text.x=element_text(angle=70, hjust=1.4, vjust = 1.4))
+```
+
+```{r}
+acf(production$production,lag.max = 60)
+```
+
+```{r}
+pacf(production$production,lag.max = 60)
+```
+```{r}
+print(production)
+print(weather_info_weighted)
+```
+
+```{r}
+model1 = lm(production[hour(datetime)>=6 & hour(datetime) <=18]$production~. -datetime, head(weather_info_weighted, 20996)[hour(datetime)>=6 & hour(datetime) <=18])
+
+summary(model1)
+checkresiduals(model1)
+```
+
+```{r}
+model1_month_hour_data <- weather_info_weighted
+model1_month_hour_data[,mon:=as.character(month(datetime,label=T))]
+model1_month_hour_data[,hour:=as.character(hour(datetime))]
+model1_month_hour_data
+```
+
+```{r}
+model1_month_hour = lm(production[hour(datetime)>=6 & hour(datetime) <=18]$production~. -datetime -mon -hour +as.factor(hour) +as.factor(mon), head(model1_month_hour_data, 20996)[hour(datetime)>=6 & hour(datetime) <=18])
+
+summary(model1_month_hour)
+checkresiduals(model1_month_hour)
+```
+
+```{r}
+pacf(model1_month_hour$residuals)
+```
+
+```{r}
+model1_lagged_month_hour_data <- weather_info_weighted
+model1_lagged_month_hour_data[,mon:=as.character(month(datetime,label=T))]
+model1_lagged_month_hour_data[,hour:=as.character(hour(datetime))]
+
+production_to_lag <- c(production$production, rep(NA, 48))
+
+model1_lagged_month_hour_data <- head(model1_lagged_month_hour_data, 20996+48) %>%
+  mutate(lag_48 = lag(production_to_lag, 48))
+
+model1_lagged_month_hour_data
+```
+
+```{r}
+model1_lagged_month_hour = lm(production[hour(datetime)>=6 & hour(datetime) <=17]$production~.-datetime -mon -hour +as.factor(hour) +as.factor(mon), head(model1_lagged_month_hour_data, 20996)[hour(datetime)>=6 & hour(datetime) <=17])
+
+summary(model1_lagged_month_hour)
+checkresiduals(model1_lagged_month_hour)
+```
+
+```{r}
+modelx_lagged_month_hour_data <- weather_info_weighted
+modelx_lagged_month_hour_data[,mon:=as.character(month(datetime,label=T))]
+modelx_lagged_month_hour_data[,hour:=as.character(hour(datetime))]
+
+production_to_lag <- c(production$production, rep(NA, 48))
+
+modelx_lagged_month_hour_data <- head(modelx_lagged_month_hour_data, 20996+48) %>%
+  mutate(lag_48 = lag(production_to_lag, 48))
+
+modelx_lagged_month_hour_data[, paste0("hour_", 0:23, "_indicator")] <- lapply(0:23, function(x) ifelse(modelx_lagged_month_hour_data$hour == x, 1, 0))
+
+for (hour in 0:23) {
+  column_name <- paste0("hour_", hour, "_interaction")
+  modelx_lagged_month_hour_data[[paste0(column_name, "_dswrf")]] <- modelx_lagged_month_hour_data$dswrf_surface * modelx_lagged_month_hour_data[[paste0("hour_", hour, "_indicator")]]
+}
+
+indicator_cols <- paste0("hour_", 0:23, "_indicator")
+
+modelx_lagged_month_hour_data <- modelx_lagged_month_hour_data %>%
+  select(-indicator_cols)
+
+modelx_lagged_month_hour_data
+```
+
+```{r}
+modelx_lagged_month_hour_data <- modelx_lagged_month_hour_data %>%
+  filter(as.numeric(hour) >= 6 & as.numeric(hour) <= 17)
+
+unused_indicator_cols <- paste0("hour_", c(0:5, 18:23), "_interaction_dswrf")
+modelx_lagged_month_hour_data <- modelx_lagged_month_hour_data %>%
+  select(-unused_indicator_cols)
+
+train_size <- floor(0.80 * nrow(modelx_lagged_month_hour_data))
+train_data <- head(modelx_lagged_month_hour_data, train_size)
+test_data <- tail(modelx_lagged_month_hour_data, nrow(modelx_lagged_month_hour_data)-train_size)
+test_data <- head(test_data, nrow(test_data)-24)
+train_data_for_prediction <- head(modelx_lagged_month_hour_data, nrow(modelx_lagged_month_hour_data)-24)
+predict_data <- tail(modelx_lagged_month_hour_data, 12)
+
+model_x_production <- production[hour(datetime)>=6 & hour(datetime) <=17]
+
+print(modelx_lagged_month_hour_data)
+print(model_x_production)
+```
+
+```{r}
+modelx = lm(head(model_x_production$production, train_size)~. -datetime -mon -hour +as.factor(mon), train_data)
+summary(modelx)
+checkresiduals(modelx)
+
+test_data$predicted <- predict(modelx, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(model_x_production$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(model_x_production$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(model_x_production$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+modelx <- lm(model_x_production$production ~ . -datetime -mon -hour +as.factor(mon), data = train_data_for_prediction)
+
+forecast <- predict(modelx, newdata = predict_data)
+forecast
+```
+
+```{r}
+find_na <- function(data) {
+  na_indices <- which(is.na(data), arr.ind = TRUE)
+  return(na_indices)
+}
+
+na_indices <- find_na(modelx_lagged_month_hour_data)
+
+print(na_indices)
+```
+
+```{r}
+modelx1_lagged_month_hour_data <- weather_info_weighted
+modelx1_lagged_month_hour_data[,mon:=as.character(month(datetime,label=T))]
+modelx1_lagged_month_hour_data[,hour:=as.character(hour(datetime))]
+
+production_to_lag <- c(production$production, rep(NA, 48))
+
+modelx1_lagged_month_hour_data <- head(modelx1_lagged_month_hour_data, 20996+48) %>%
+  mutate(lag_48 = lag(production_to_lag, 48))
+
+modelx1_lagged_month_hour_data[, paste0("hour_", 0:23, "_indicator")] <- lapply(0:23, function(x) ifelse(modelx1_lagged_month_hour_data$hour == x, 1, 0))
+
+for (hour in 0:23) {
+  column_name <- paste0("hour_", hour, "_interaction")
+  modelx1_lagged_month_hour_data[[paste0(column_name, "_dswrf")]] <- modelx1_lagged_month_hour_data$dswrf_surface * modelx1_lagged_month_hour_data[[paste0("hour_", hour, "_indicator")]]
+}
+
+indicator_cols <- paste0("hour_", 0:23, "_indicator")
+
+modelx1_lagged_month_hour_data <- modelx1_lagged_month_hour_data %>%
+  select(-indicator_cols)
+
+months <- month.abb[1:12]
+
+modelx1_lagged_month_hour_data[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(modelx1_lagged_month_hour_data$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  modelx1_lagged_month_hour_data[[paste0(column_name, "_dswrf")]] <- modelx1_lagged_month_hour_data$dswrf_surface * modelx1_lagged_month_hour_data[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+modelx1_lagged_month_hour_data <- modelx1_lagged_month_hour_data %>%
+  select(-indicator_cols2)
+
+tail(modelx1_lagged_month_hour_data)
+```
+
+```{r}
+#filtered_data <- filtered_data %>%
+#  mutate(sum_cloud_layers = tdc_low.cloud.layer + tdc_middle.cloud.layer + tdc_high.cloud.layer + tdc_entire.atmosphere)
+```
+
+```{r}
+modelx1_lagged_month_hour_data <- modelx1_lagged_month_hour_data %>%
+  filter(as.numeric(hour) >= 6 & as.numeric(hour) <= 17)
+
+unused_indicator_cols <- paste0("hour_", c(0:5, 18:23), "_interaction_dswrf")
+modelx1_lagged_month_hour_data <- modelx1_lagged_month_hour_data %>%
+  select(-unused_indicator_cols)
+
+train_size <- floor(0.80 * nrow(modelx1_lagged_month_hour_data))
+train_data <- head(modelx1_lagged_month_hour_data, train_size)
+test_data <- tail(modelx1_lagged_month_hour_data, nrow(modelx1_lagged_month_hour_data)-train_size)
+test_data <- head(test_data, nrow(test_data)-24)
+train_data_for_prediction <- head(modelx1_lagged_month_hour_data, nrow(modelx1_lagged_month_hour_data)-24)
+predict_data <- tail(modelx1_lagged_month_hour_data, 12)
+
+model_x1_production <- production[hour(datetime)>=6 & hour(datetime) <=17]
+
+print(modelx1_lagged_month_hour_data)
+print(model_x1_production)
+```
+
+```{r}
+train_data
+head(model_x1_production, train_size)
+```
+
+```{r}
+modelx1 = lm(head(model_x1_production$production, train_size)~. -datetime -mon -hour, train_data)
+summary(modelx1)
+checkresiduals(modelx1)
+
+test_data$predicted <- predict(modelx1, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(model_x1_production$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(model_x1_production$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(model_x1_production$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+modelx1 <- lm(model_x1_production$production ~ . -datetime -mon -hour, data = train_data_for_prediction)
+
+forecast <- predict(modelx1, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_6_forecast <- weather_info_weighted %>%
+  filter(hour == 6)
+
+hour_6_forecast$dswrf_log <- log(hour_6_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_6_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_6_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_6_forecast[[paste0(column_name, '_dswrf')]] <- hour_6_forecast$dswrf_surface * hour_6_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_6_forecast <- hour_6_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_6_na <- c(production[hour(datetime)==6]$production, rep(NA, 2))
+
+hour_6_forecast <- head(hour_6_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_6_na, 2))
+
+print(production[hour(datetime)==6])
+print(hour_6_forecast)
+
+ggplot(head(hour_6_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==6]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_6_forecast))
+train_data <- head(hour_6_forecast, train_size)
+test_data <- tail(hour_6_forecast, nrow(hour_6_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_6_forecast, nrow(hour_6_forecast)-2)
+predict_data <- tail(hour_6_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_6 <- lm(head(production[hour(datetime)==6]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_6)
+#checkresiduals(model_hour_6)
+
+test_data$predicted <- predict(model_hour_6, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==6]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==6]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==6]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==6]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_6 <- lm(production[hour(datetime)==6]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_6, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_7_forecast <- weather_info_weighted %>%
+  filter(hour == 7)
+
+hour_7_forecast$dswrf_log <- log(hour_7_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_7_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_7_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_7_forecast[[paste0(column_name, '_dswrf')]] <- hour_7_forecast$dswrf_surface * hour_7_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_7_forecast <- hour_7_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_7_na <- c(production[hour(datetime)==7]$production, rep(NA, 2))
+
+hour_7_forecast <- head(hour_7_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_7_na, 2))
+
+print(production[hour(datetime)==7])
+print(hour_7_forecast)
+
+ggplot(head(hour_7_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==7]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_7_forecast))
+train_data <- head(hour_7_forecast, train_size)
+test_data <- tail(hour_7_forecast, nrow(hour_7_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_7_forecast, nrow(hour_7_forecast)-2)
+predict_data <- tail(hour_7_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_7 <- lm(head(production[hour(datetime)==7]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_7)
+#checkresiduals(model_hour_7)
+
+test_data$predicted <- predict(model_hour_7, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==7]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==7]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==7]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==7]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_7 <- lm(production[hour(datetime)==7]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_7, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_8_forecast <- weather_info_weighted %>%
+  filter(hour == 8)
+
+hour_8_forecast$dswrf_log <- log(hour_8_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_8_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_8_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_8_forecast[[paste0(column_name, '_dswrf')]] <- hour_8_forecast$dswrf_surface * hour_8_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_8_forecast <- hour_8_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_8_na <- c(production[hour(datetime)==8]$production, rep(NA, 2))
+
+hour_8_forecast <- head(hour_8_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_8_na, 2))
+
+print(production[hour(datetime)==8])
+print(hour_8_forecast)
+
+ggplot(head(hour_8_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==8]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_8_forecast))
+train_data <- head(hour_8_forecast, train_size)
+test_data <- tail(hour_8_forecast, nrow(hour_8_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_8_forecast, nrow(hour_8_forecast)-2)
+predict_data <- tail(hour_8_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_8 <- lm(head(production[hour(datetime)==8]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_8)
+checkresiduals(model_hour_8)
+
+test_data$predicted <- predict(model_hour_8, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==8]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==8]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==8]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==8]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_8 <- lm(production[hour(datetime)==8]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_8, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_9_forecast <- weather_info_weighted %>%
+  filter(hour == 9)
+
+hour_9_forecast$dswrf_log <- log(hour_9_forecast$dswrf_surface+1)
+
+#hour_9_forecast <- hour_9_forecast %>%
+#  mutate(
+#    dswrf_surface_higherpiece = ifelse(dswrf_surface > 75, dswrf_surface, 0),
+#    dswrf_surface_lowerpiece = ifelse(dswrf_surface <= 75, dswrf_surface, 0)
+#  )
+
+months <- month.abb[1:12]
+hour_9_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_9_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_9_forecast[[paste0(column_name, '_dswrf')]] <- hour_9_forecast$dswrf_surface * hour_9_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_9_forecast <- hour_9_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_9_na <- c(production[hour(datetime)==9]$production, rep(NA, 2))
+
+hour_9_forecast <- head(hour_9_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_9_na, 2))
+
+print(production[hour(datetime)==9])
+print(hour_9_forecast)
+
+ggplot(head(hour_9_forecast, 875), aes(x=dswrf_log, y=production[hour(datetime)==9]$production)) +
+  geom_point()
+```
+```{r}
+train_size <- floor(0.80 * nrow(hour_9_forecast))
+train_data <- head(hour_9_forecast, train_size)
+test_data <- tail(hour_9_forecast, nrow(hour_9_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_9_forecast, nrow(hour_9_forecast)-2)
+predict_data <- tail(hour_9_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_9 <- lm(head(production[hour(datetime)==9]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_9)
+checkresiduals(model_hour_9)
+
+test_data$predicted <- predict(model_hour_9, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==9]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==9]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==9]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==9]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_9 <- lm(production[hour(datetime)==9]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_9, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_10_forecast <- weather_info_weighted %>%
+  filter(hour == 10)
+
+hour_10_forecast$dswrf_log <- log(hour_10_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_10_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_10_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_10_forecast[[paste0(column_name, '_dswrf')]] <- hour_10_forecast$dswrf_surface * hour_10_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_10_forecast <- hour_10_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_10_na <- c(production[hour(datetime)==10]$production, rep(NA, 2))
+
+hour_10_forecast <- head(hour_10_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_10_na, 2))
+
+print(production[hour(datetime)==10])
+print(hour_10_forecast)
+
+ggplot(head(hour_10_forecast, 875), aes(x=dswrf_log, y=production[hour(datetime)==10]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_10_forecast))
+train_data <- head(hour_10_forecast, train_size)
+test_data <- tail(hour_10_forecast, nrow(hour_10_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_10_forecast, nrow(hour_10_forecast)-2)
+predict_data <- tail(hour_10_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_10 <- lm(head(production[hour(datetime)==10]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_10)
+checkresiduals(model_hour_10)
+
+test_data$predicted <- predict(model_hour_10, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==10]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==10]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==10]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==10]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_10 <- lm(production[hour(datetime)==10]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_10, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_11_forecast <- weather_info_weighted %>%
+  filter(hour == 11)
+
+hour_11_forecast$dswrf_log <- log(hour_11_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_11_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_11_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_11_forecast[[paste0(column_name, '_dswrf')]] <- hour_11_forecast$dswrf_log * hour_11_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_11_forecast <- hour_11_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_11_na <- c(production[hour(datetime)==11]$production, rep(NA, 2))
+
+hour_11_forecast <- head(hour_11_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_11_na, 2))
+
+print(production[hour(datetime)==11])
+print(hour_11_forecast)
+
+ggplot(head(hour_11_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==12]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_11_forecast))
+train_data <- head(hour_11_forecast, train_size)
+test_data <- tail(hour_11_forecast, nrow(hour_11_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_11_forecast, nrow(hour_11_forecast)-2)
+predict_data <- tail(hour_11_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_11 <- lm(head(production[hour(datetime)==11]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_11)
+checkresiduals(model_hour_11)
+
+test_data$predicted <- predict(model_hour_11, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==11]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==11]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==11]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==11]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_11 <- lm(production[hour(datetime)==11]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_11, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_12_forecast <- weather_info_weighted %>%
+  filter(hour == 12)
+
+hour_12_forecast$dswrf_log <- log(hour_12_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_12_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_12_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_12_forecast[[paste0(column_name, '_dswrf')]] <- hour_12_forecast$dswrf_surface * hour_12_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_12_forecast <- hour_12_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_12_na <- c(production[hour(datetime)==12]$production, rep(NA, 2))
+
+hour_12_forecast <- head(hour_12_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_12_na, 2))
+
+print(production[hour(datetime)==12])
+print(hour_12_forecast)
+
+ggplot(head(hour_12_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==12]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_12_forecast))
+train_data <- head(hour_12_forecast, train_size)
+test_data <- tail(hour_12_forecast, nrow(hour_12_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_12_forecast, nrow(hour_12_forecast)-2)
+predict_data <- tail(hour_12_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_12 <- lm(head(production[hour(datetime)==12]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_12)
+checkresiduals(model_hour_12)
+
+test_data$predicted <- predict(model_hour_12, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==12]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==12]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==12]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==12]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_12 <- lm(production[hour(datetime)==12]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_12, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_13_forecast <- weather_info_weighted %>%
+  filter(hour == 13)
+
+hour_13_forecast$dswrf_log <- log(hour_13_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_13_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_13_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_13_forecast[[paste0(column_name, '_dswrf')]] <- hour_13_forecast$dswrf_surface * hour_13_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_13_forecast <- hour_13_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_13_na <- c(production[hour(datetime)==13]$production, rep(NA, 2))
+
+hour_13_forecast <- head(hour_13_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_13_na, 2))
+
+print(production[hour(datetime)==13])
+print(hour_13_forecast)
+
+ggplot(head(hour_13_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==13]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_13_forecast))
+train_data <- head(hour_13_forecast, train_size)
+test_data <- tail(hour_13_forecast, nrow(hour_13_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_13_forecast, nrow(hour_13_forecast)-2)
+predict_data <- tail(hour_13_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_13 <- lm(head(production[hour(datetime)==13]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_13)
+checkresiduals(model_hour_13)
+
+test_data$predicted <- predict(model_hour_13, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==13]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==13]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==13]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==13]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_13 <- lm(production[hour(datetime)==13]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_13, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_14_forecast <- weather_info_weighted %>%
+  filter(hour == 14)
+
+hour_14_forecast$dswrf_log <- log(hour_14_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_14_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_14_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_14_forecast[[paste0(column_name, '_dswrf')]] <- hour_14_forecast$dswrf_surface * hour_14_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_14_forecast <- hour_14_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_14_na <- c(production[hour(datetime)==14]$production, rep(NA, 2))
+
+hour_14_forecast <- head(hour_14_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_14_na, 2))
+
+print(production[hour(datetime)==14])
+print(hour_14_forecast)
+
+ggplot(head(hour_14_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==14]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_14_forecast))
+train_data <- head(hour_14_forecast, train_size)
+test_data <- tail(hour_14_forecast, nrow(hour_14_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_14_forecast, nrow(hour_14_forecast)-2)
+predict_data <- tail(hour_14_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_14 <- lm(head(production[hour(datetime)==14]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_14)
+checkresiduals(model_hour_14)
+
+test_data$predicted <- predict(model_hour_14, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==14]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==14]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==14]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==14]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_14 <- lm(production[hour(datetime)==14]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_14, newdata = predict_data)
+forecast
+```
+
+
+
+```{r}
+hour_15_forecast <- weather_info_weighted %>%
+  filter(hour == 15)
+
+hour_15_forecast$dswrf_log <- log(hour_15_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_15_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_15_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_15_forecast[[paste0(column_name, '_dswrf')]] <- hour_15_forecast$dswrf_surface * hour_15_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_15_forecast <- hour_15_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_15_na <- c(production[hour(datetime)==15]$production, rep(NA, 2))
+
+hour_15_forecast <- head(hour_15_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_15_na, 2))
+
+print(production[hour(datetime)==15])
+print(hour_15_forecast)
+
+ggplot(head(hour_15_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==15]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_15_forecast))
+train_data <- head(hour_15_forecast, train_size)
+test_data <- tail(hour_15_forecast, nrow(hour_15_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_15_forecast, nrow(hour_15_forecast)-2)
+predict_data <- tail(hour_15_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_15 <- lm(head(production[hour(datetime)==15]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_15)
+checkresiduals(model_hour_15)
+
+test_data$predicted <- predict(model_hour_15, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==15]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==15]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==15]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==15]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_15 <- lm(production[hour(datetime)==15]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_15, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_16_forecast <- weather_info_weighted %>%
+  filter(hour == 16)
+
+hour_16_forecast$dswrf_log <- log(hour_16_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_16_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_16_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_16_forecast[[paste0(column_name, '_dswrf')]] <- hour_16_forecast$dswrf_surface * hour_16_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_16_forecast <- hour_16_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_16_na <- c(production[hour(datetime)==16]$production, rep(NA, 2))
+
+hour_16_forecast <- head(hour_16_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_16_na, 2))
+
+print(production[hour(datetime)==16])
+print(hour_16_forecast)
+
+ggplot(head(hour_16_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==16]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_16_forecast))
+train_data <- head(hour_16_forecast, train_size)
+test_data <- tail(hour_16_forecast, nrow(hour_16_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_16_forecast, nrow(hour_16_forecast)-2)
+predict_data <- tail(hour_16_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_16 <- lm(head(production[hour(datetime)==16]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_16)
+checkresiduals(model_hour_16)
+
+test_data$predicted <- predict(model_hour_16, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==16]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==16]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==16]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==16]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_16 <- lm(production[hour(datetime)==16]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_16, newdata = predict_data)
+forecast
+```
+
+```{r}
+hour_17_forecast <- weather_info_weighted %>%
+  filter(hour == 17)
+
+hour_17_forecast$dswrf_log <- log(hour_17_forecast$dswrf_surface+1)
+
+months <- month.abb[1:12]
+hour_17_forecast[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(hour_17_forecast$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  hour_17_forecast[[paste0(column_name, '_dswrf')]] <- hour_17_forecast$dswrf_surface * hour_17_forecast[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+
+hour_17_forecast <- hour_17_forecast %>%
+  select(-indicator_cols2)
+
+production_hour_17_na <- c(production[hour(datetime)==17]$production, rep(NA, 2))
+
+hour_17_forecast <- head(hour_17_forecast, 877) %>%
+  mutate(lag_48 = lag(production_hour_17_na, 2))
+
+print(production[hour(datetime)==17])
+print(hour_17_forecast)
+
+ggplot(head(hour_17_forecast, 875), aes(x=dswrf_surface, y=production[hour(datetime)==17]$production)) +
+  geom_point()
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(hour_17_forecast))
+train_data <- head(hour_17_forecast, train_size)
+test_data <- tail(hour_17_forecast, nrow(hour_17_forecast)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(hour_17_forecast, nrow(hour_17_forecast)-2)
+predict_data <- tail(hour_17_forecast, 1)
+
+print(predict_data)
+```
+
+```{r}
+model_hour_17 <- lm(head(production[hour(datetime)==17]$production, train_size) ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data)
+
+summary(model_hour_17)
+checkresiduals(model_hour_17)
+
+test_data$predicted <- predict(model_hour_17, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+test_data$predicted[test_data$predicted > 10] <- 10
+
+print(accu(tail(production[hour(datetime)==17]$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production[hour(datetime)==17]$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=datetime)) + geom_line(aes(y=tail(production[hour(datetime)==17]$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+test_data$residual <- tail(production[hour(datetime)==17]$production, nrow(test_data)) - test_data$predicted
+
+drop_vars = c('datetime','mon','dswrf_surface','predicted')
+fit_res_tree=rpart(residual~.,test_data[,-drop_vars,with=F],
+                   method='anova',control=rpart.control(cp=0,maxdepth=3,minbucket=30))
+
+fancyRpartPlot(fit_res_tree)
+
+model_hour_17 <- lm(production[hour(datetime)==17]$production ~ . -lag_48 -datetime -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(model_hour_17, newdata = predict_data)
+forecast
+```
+
+```{r}
+summed_data_1 <- weather_info_weighted
+
+summed_data_1 <- summed_data_1 %>%
+  filter((as.numeric(hour) >= 6 & as.numeric(hour) <= 8) | (as.numeric(hour) >= 15 & as.numeric(hour) <= 17))
+
+summed_data_1 <- summed_data_1 %>%
+  mutate(date = as.Date(datetime))
+
+summed_data_1 <- summed_data_1 %>%
+  dplyr::select(-hour, -mon, -datetime)
+
+summed_data_1 <- summed_data_1 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+summed_data_1 <- summed_data_1 %>%
+  mutate(mon = as.character(month(date,label=T)))
+
+months <- month.abb[1:12]
+
+summed_data_1[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(summed_data_1$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  summed_data_1[[paste0(column_name, "_dswrf")]] <- summed_data_1$dswrf_surface * summed_data_1[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+summed_data_1 <- summed_data_1 %>%
+  select(-indicator_cols2)
+
+production_summed_1 <- production
+
+production_summed_1 <- production_summed_1 %>%
+  filter((hour(datetime) >= 6 & hour(datetime) <= 8) | (hour(datetime) >= 15 & hour(datetime) <= 17))
+
+production_summed_1 <- production_summed_1 %>%
+  mutate(date = as.Date(datetime))
+
+production_summed_1 <- production_summed_1 %>%
+  select(-datetime)
+
+production_summed_1 <- production_summed_1 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+production_summed_1_na <- c(production_summed_1$production, rep(NA, 2))
+
+summed_data_1 <- head(summed_data_1, 877) %>%
+  mutate(lag_48 = lag(production_summed_1_na, 2))
+
+tail(summed_data_1)
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(summed_data_1))
+train_data <- head(summed_data_1, train_size)
+test_data <- tail(summed_data_1, nrow(summed_data_1)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(summed_data_1, nrow(summed_data_1)-2)
+predict_data <- tail(summed_data_1, 1)
+
+print(predict_data)
+```
+
+```{r}
+summed_data_1_model <- lm(head(production_summed_1$production, train_size) ~ . -lag_48 -date -mon -dswrf_surface, data = train_data)
+summary(summed_data_1_model)
+checkresiduals(summed_data_1_model)
+
+test_data$predicted <- predict(summed_data_1_model, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+
+print(accu(tail(production_summed_1$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production_summed_1$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=date)) + geom_line(aes(y=tail(production_summed_1$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+summed_data_1_model <- lm(production_summed_1$production ~ . -lag_48 -date -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(summed_data_1_model, newdata = predict_data)
+forecast
+```
+
+```{r}
+summed_data_2 <- weather_info_weighted
+
+summed_data_2 <- summed_data_2 %>%
+  filter(as.numeric(hour) >= 9 & as.numeric(hour) <= 14)
+
+summed_data_2 <- summed_data_2 %>%
+  mutate(date = as.Date(datetime))
+
+summed_data_2 <- summed_data_2 %>%
+  dplyr::select(-hour, -mon, -datetime)
+
+summed_data_2 <- summed_data_2 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+summed_data_2 <- summed_data_2 %>%
+  mutate(mon = as.character(month(date,label=T)))
+
+summed_data_2 <- summed_data_2 %>%
+  mutate(dswrf_surface_log = log(dswrf_surface))
+
+months <- month.abb[1:12]
+
+summed_data_2[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(summed_data_2$mon == x, 1, 0))
+
+for (month in months) {
+  column_name <- paste0("month_", month, "_interaction")
+  summed_data_2[[paste0(column_name, "_dswrf")]] <- summed_data_2$dswrf_surface_log * summed_data_2[[paste0("month_", month, "_indicator")]]
+}
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+summed_data_2 <- summed_data_2 %>%
+  select(-indicator_cols2)
+
+production_summed_2 <- production
+
+production_summed_2 <- production_summed_2 %>%
+  filter(hour(datetime) >= 9 & hour(datetime) <= 14)
+
+production_summed_2 <- production_summed_2 %>%
+  mutate(date = as.Date(datetime))
+
+production_summed_2 <- production_summed_2 %>%
+  select(-datetime)
+
+production_summed_2 <- production_summed_2 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+production_summed_2_na <- c(production_summed_2$production, rep(NA, 2))
+
+summed_data_2 <- head(summed_data_2, 877) %>%
+  mutate(lag_48 = lag(production_summed_2_na, 2))
+
+tail(summed_data_2)
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(summed_data_2))
+train_data <- head(summed_data_2, train_size)
+test_data <- tail(summed_data_2, nrow(summed_data_2)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(summed_data_2, nrow(summed_data_2)-2)
+predict_data <- tail(summed_data_2, 1)
+
+print(predict_data)
+```
+
+```{r}
+summed_data_2_model <- lm(head(production_summed_2$production, train_size) ~ . -lag_48 -date -mon -dswrf_surface, data = train_data)
+summary(summed_data_2_model)
+checkresiduals(summed_data_2_model)
+
+test_data$predicted <- predict(summed_data_2_model, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+
+print(accu(tail(production_summed_2$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production_summed_2$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=date)) + geom_line(aes(y=tail(production_summed_2$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+summed_data_2_model <- lm(production_summed_2$production ~ . -lag_48 -date -mon -dswrf_surface, data = train_data_for_prediction)
+
+forecast <- predict(summed_data_2_model, newdata = predict_data)
+forecast
+```
+
+```{r}
+summed_data_3 <- weather_info_weighted
+
+summed_data_3 <- summed_data_3 %>%
+  filter(as.numeric(hour) >= 9 & as.numeric(hour) <= 14)
+
+summed_data_3 <- summed_data_3 %>%
+  mutate(date = as.Date(datetime))
+
+summed_data_3 <- summed_data_3 %>%
+  dplyr::select(-hour, -mon, -datetime)
+
+summed_data_3 <- summed_data_3 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+summed_data_3 <- summed_data_3 %>%
+  mutate(mon = as.character(month(date,label=T)))
+
+months <- month.abb[1:12]
+
+summed_data_3[, paste0("month_", months, "_indicator")] <- lapply(months, function(x) ifelse(summed_data_3$mon == x, 1, 0))
+
+indicator_cols2 <- paste0("month_", months, "_indicator")
+summed_data_3 <- summed_data_3 %>%
+  select(-indicator_cols2)
+
+production_summed_3 <- production
+
+production_summed_3 <- production_summed_3 %>%
+  filter(hour(datetime) >= 9 & hour(datetime) <= 14)
+
+production_summed_3 <- production_summed_3 %>%
+  mutate(date = as.Date(datetime))
+
+production_summed_3 <- production_summed_3 %>%
+  select(-datetime)
+
+production_summed_3 <- production_summed_3 %>%
+  group_by(date) %>%
+  summarise_all(sum)
+
+production_summed_3_na <- c(production_summed_3$production, rep(NA, 2))
+
+summed_data_3 <- head(summed_data_3, 877) %>%
+  mutate(lag_48 = lag(production_summed_3_na, 2))
+
+summed_data_3 <- summed_data_3 %>%
+  mutate(
+    dswrf_surface_higherpiece = ifelse(dswrf_surface > 2800, dswrf_surface, 0),
+    dswrf_surface_lowerpiece = ifelse(dswrf_surface <= 2800, dswrf_surface, 0)
+  )
+
+tail(summed_data_3, 24)
+```
+
+```{r}
+train_size <- floor(0.80 * nrow(summed_data_3))
+train_data <- head(summed_data_3, train_size)
+test_data <- tail(summed_data_3, nrow(summed_data_3)-train_size)
+test_data <- head(test_data, nrow(test_data)-2)
+train_data_for_prediction <- head(summed_data_3, nrow(summed_data_3)-2)
+predict_data <- tail(summed_data_3, 1)
+
+print(predict_data)
+```
+
+```{r}
+summed_data_3_model <- lm(head(production_summed_3$production, train_size) ~ . -lag_48 -dswrf_surface -date, data = train_data)
+summary(summed_data_3_model)
+checkresiduals(summed_data_3_model)
+
+plot(train_data$dswrf_surface, predict(summed_data_3_model, train_data))
+points(train_data$dswrf_surface, head(production_summed_3$production, train_size),col='red')
+
+test_data$predicted <- predict(summed_data_3_model, newdata = test_data)
+test_data$predicted[test_data$predicted < 0] <- 0
+
+print(accu(tail(production_summed_3$production, nrow(test_data)), test_data$predicted))
+
+ggplot(test_data, aes(x = predicted, y = tail(production_summed_3$production, nrow(test_data)))) +
+  geom_point() + 
+  geom_abline(color = "red") +
+  labs(x = "Predicted", y = "Real")
+
+ggplot(test_data, aes(x=date)) + geom_line(aes(y=tail(production_summed_3$production, nrow(test_data)), color='Real')) + geom_line(aes(y=predicted, color='prediction'))
+
+summed_data_3_model <- lm(production_summed_3$production ~ . -lag_48 -dswrf_surface -date, data = train_data_for_prediction)
+
+forecast <- predict(summed_data_3_model, newdata = predict_data)
+forecast
+```
+
+```{r}
+naive_production <- production
+naive_production$production_lag2 <- lag(naive_production$production, n = 48)
+naive_production <- naive_production %>% filter(datetime >= as.Date('2024-02-01'))
+naive_production <- naive_production %>% filter(datetime <= as.Date('2024-05-15'))
+print(accu(naive_production$production, naive_production$production_lag2))
+```
+
+```{r}
+production_sma_hour4 <- production %>%
+  filter(hour(datetime) == 4)
+production_sma_hour4$production_lag2 <- lag(production_sma_hour4$production, n = 2)
+
+production_sma_hour5 <- production %>%
+  filter(hour(datetime) == 5)
+production_sma_hour5$production_lag2 <- lag(production_sma_hour5$production, n = 2)
+
+production_sma_hour18 <- production %>%
+  filter(hour(datetime) == 18)
+production_sma_hour18$production_lag2 <- lag(production_sma_hour18$production, n = 2)
+
+moving_average <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      NA
+    } else {
+      mean(x[(i-n+1):i])
+    }
+  })
+}
+
+wmape <- function(x, n, f) {
+  ma <- moving_average(x, n)
+  mean(abs(f - ma) / mean(f, na.rm = TRUE), na.rm = TRUE)
+}
+
+best_window_length <- function(x, f, max_window_size = 10) {
+  n_values <- seq_len(max_window_size)
+  wmape_values <- sapply(n_values, function(n) wmape(x, n, f))
+  print(wmape_values)
+  which.min(wmape_values)
+}
+
+best_window_length(production_sma_hour4$production, production_sma_hour4$production_lag2)
+best_window_length(production_sma_hour5$production, production_sma_hour5$production_lag2)
+best_window_length(production_sma_hour18$production, production_sma_hour18$production_lag2)
+```
+
+```{r}
+new_rows <- data.frame(
+  datetime = as.POSIXct(c("2024-05-25 06:00:00", "2024-05-26 06:00:00"), format = "%Y-%m-%d %H:%M:%S"),
+  production = c(NA, NA),
+  production_lag2 = c(0, 0)
+)
+
+production_sma_hour4 <- rbind(production_sma_hour4, new_rows)
+production_sma_hour5 <- rbind(production_sma_hour5, new_rows)
+production_sma_hour18 <- rbind(production_sma_hour18, new_rows)
+
+production_sma_hour4
+```
+
+```{r}
+moving_average <- function(x, n) {
+  sapply(seq_along(x), function(i) {
+    if (i < n) {
+      NA
+    } else {
+      mean(x[(i-n+1):i])
+    }
+  })
+}
+
+production_sma_hour4$sma_forecasts <- moving_average(production_sma_hour4$production_lag2, 3)
+production_sma_hour5$sma_forecasts <- moving_average(production_sma_hour5$production_lag2, 3)
+production_sma_hour18$sma_forecasts <- moving_average(production_sma_hour18$production_lag2, 3)
+
+production_sma_hour4 <- production_sma_hour4 %>%
+  filter(as.Date(datetime) >= as.Date('2024-02-01'))
+production_sma_hour5 <- production_sma_hour5 %>%
+  filter(as.Date(datetime) >= as.Date('2024-02-01'))
+production_sma_hour18 <- production_sma_hour18 %>%
+  filter(as.Date(datetime) >= as.Date('2024-02-01'))
+```
+
+```{r}
+test_horizon_start <- as.POSIXct("2024-02-01 00:00:00", format = "%Y-%m-%d %H:%M:%S")
+test_horizon_end <- as.POSIXct("2024-05-26 23:00:00", format = "%Y-%m-%d %H:%M:%S")
+
+diff_days <- round(difftime(test_horizon_end, test_horizon_start, units = "days"))
+zero_vector <- rep(0, diff_days)
+```
+
+```{r}
+test_horizon_data_1 <- summed_data_1 %>%
+  filter(date > as.Date(test_horizon_start) & as.Date(test_horizon_end) >= date)
+forecasts <- predict(summed_data_1_model, newdata = test_horizon_data_1)
+weights_cluster_3 <- c(0.028560312, 0.150408073, 0.363920275, 0.300924708, 0.120982008, 0.035204624)
+
+results_cluster_3 <- as.data.frame(outer(forecasts, weights_cluster_3, "*"))
+
+results_cluster_3
+```
+
+```{r}
+test_horizon_data_2 <- summed_data_2 %>%
+  filter(date > as.Date(test_horizon_start) & as.Date(test_horizon_end) >= date)
+forecasts_c4 <- predict(summed_data_2_model, newdata = test_horizon_data_2)
+weights_cluster_4 <- c(0.163615062, 0.174684177, 0.176403689, 0.178151998, 0.166458302, 0.140686771)
+
+results_cluster_4 <- as.data.frame(outer(forecasts_c4, weights_cluster_4, "*"))
+
+forecasts_c4
+results_cluster_4
+```
+
+```{r}
+test_horizon_data_h_6 <- hour_6_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_6 <- predict(model_hour_6, newdata = test_horizon_data_h_6)
+results_hour_6
+```
+
+```{r}
+test_horizon_data_h_7 <- hour_7_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_7 <- predict(model_hour_7, newdata = test_horizon_data_h_7)
+results_hour_7
+```
+
+```{r}
+test_horizon_data_h_8 <- hour_8_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_8 <- predict(model_hour_8, newdata = test_horizon_data_h_8)
+results_hour_8
+```
+
+```{r}
+test_horizon_data_h_9 <- hour_9_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_9 <- predict(model_hour_9, newdata = test_horizon_data_h_9)
+results_hour_9
+```
+
+```{r}
+test_horizon_data_h_10 <- hour_10_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_10 <- predict(model_hour_10, newdata = test_horizon_data_h_10)
+results_hour_10
+```
+
+```{r}
+test_horizon_data_h_11 <- hour_11_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_11 <- predict(model_hour_11, newdata = test_horizon_data_h_11)
+results_hour_11
+```
+
+```{r}
+test_horizon_data_h_12 <- hour_12_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_12 <- predict(model_hour_12, newdata = test_horizon_data_h_12)
+results_hour_12
+```
+
+```{r}
+test_horizon_data_h_13 <- hour_13_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_13 <- predict(model_hour_13, newdata = test_horizon_data_h_13)
+results_hour_13
+```
+
+```{r}
+test_horizon_data_h_14 <- hour_14_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_14 <- predict(model_hour_14, newdata = test_horizon_data_h_14)
+results_hour_14
+```
+
+```{r}
+test_horizon_data_h_15 <- hour_15_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_15 <- predict(model_hour_15, newdata = test_horizon_data_h_15)
+results_hour_15
+```
+
+```{r}
+test_horizon_data_h_16 <- hour_16_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_16 <- predict(model_hour_16, newdata = test_horizon_data_h_16)
+results_hour_16
+```
+
+```{r}
+test_horizon_data_h_17 <- hour_17_forecast %>%
+  filter(datetime > test_horizon_start & test_horizon_end >= datetime)
+
+results_hour_17 <- predict(model_hour_17, newdata = test_horizon_data_h_17)
+results_hour_17
+```
+
+```{r}
+aggregate_c4 <- data.frame(
+  hour_9 = results_hour_9,
+  hour_10 = results_hour_10,
+  hour_11 = results_hour_11,
+  hour_12 = results_hour_12,
+  hour_13 = results_hour_13,
+  hour_14 = results_hour_14
+)
+
+aggregate_c4$summed <- rowSums(aggregate_c4[, c("hour_9", "hour_10", "hour_11", "hour_12", "hour_13", "hour_14")])
+
+aggregate_c4 <- aggregate_c4 %>%
+  mutate(hour_9_normalized = hour_9 / summed,
+         hour_10_normalized = hour_10 / summed,
+         hour_11_normalized = hour_11 / summed,
+         hour_12_normalized = hour_12 / summed,
+         hour_13_normalized = hour_13 / summed,
+         hour_14_normalized = hour_14 / summed)
+```
+
+```{r}
+test_horizon_forecasts <- data.frame(
+  date = as.Date(production_sma_hour4$datetime),
+  hour_0 = zero_vector,
+  hour_1 = zero_vector,
+  hour_2 = zero_vector,
+  hour_3 = zero_vector,
+  hour_4 = production_sma_hour4$sma_forecasts,
+  hour_5 = production_sma_hour5$sma_forecasts,
+  hour_6 = results_cluster_3$V1,
+  hour_7 = results_cluster_3$V2,
+  hour_8 = results_cluster_3$V3,
+  hour_9 = forecasts_c4 * aggregate_c4$hour_9_normalized,
+  hour_10 = forecasts_c4 * aggregate_c4$hour_10_normalized,
+  hour_11 = forecasts_c4 * aggregate_c4$hour_11_normalized,
+  hour_12 = forecasts_c4 * aggregate_c4$hour_12_normalized,
+  hour_13 = forecasts_c4 * aggregate_c4$hour_13_normalized,
+  hour_14 = forecasts_c4 * aggregate_c4$hour_14_normalized,
+  hour_15 = results_cluster_3$V4,
+  hour_16 = results_cluster_3$V5,
+  hour_17 = results_cluster_3$V6,
+  hour_18 = production_sma_hour18$sma_forecasts,
+  hour_19 = zero_vector,
+  hour_20 = zero_vector,
+  hour_21 = zero_vector,
+  hour_22 = zero_vector,
+  hour_23 = zero_vector
+)
+
+test_horizon_forecasts
+```
+
+```{r}
+test_horizon_forecasts_eval <- test_horizon_forecasts %>%
+  select(-date)
+
+appended_vector <- apply(test_horizon_forecasts_eval, 1, function(row) paste(row, collapse = ","))
+numeric_vector <- unlist(lapply(strsplit(appended_vector, ","), as.numeric))
+
+production_planning_horizon <- production %>%
+  filter(datetime >= test_horizon_start & test_horizon_end >= datetime)
+
+print(accu(production_planning_horizon$production, head(numeric_vector, length(numeric_vector)-48)))
+```
+
+```{r}
+tomorrow <- as.Date("2024-05-26", format = "%Y-%m-%d")
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  filter(date == tomorrow)
+
+test_horizon_forecasts
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  select(-date)
+
+print(sum(test_horizon_forecasts))
+```
+
+```{r}
+test_horizon_forecasts <- data.frame(
+  date = as.Date(production_sma_hour4$datetime),
+  hour_0 = zero_vector,
+  hour_1 = zero_vector,
+  hour_2 = zero_vector,
+  hour_3 = zero_vector,
+  hour_4 = production_sma_hour4$sma_forecasts,
+  hour_5 = production_sma_hour5$sma_forecasts,
+  hour_6 = results_cluster_3$V1,
+  hour_7 = results_cluster_3$V2,
+  hour_8 = results_cluster_3$V3,
+  hour_9 = results_cluster_4$V1,
+  hour_10 = results_cluster_4$V2,
+  hour_11 = results_cluster_4$V3,
+  hour_12 = results_cluster_4$V4,
+  hour_13 = results_cluster_4$V5,
+  hour_14 = results_cluster_4$V6,
+  hour_15 = results_cluster_3$V4,
+  hour_16 = results_cluster_3$V5,
+  hour_17 = results_cluster_3$V6,
+  hour_18 = production_sma_hour18$sma_forecasts,
+  hour_19 = zero_vector,
+  hour_20 = zero_vector,
+  hour_21 = zero_vector,
+  hour_22 = zero_vector,
+  hour_23 = zero_vector
+)
+
+test_horizon_forecasts
+
+write.xlsx(test_horizon_forecasts, "summed_model_forecasts.xlsx")
+```
+
+```{r}
+test_horizon_forecasts_eval <- test_horizon_forecasts %>%
+  select(-date)
+
+appended_vector <- apply(test_horizon_forecasts_eval, 1, function(row) paste(row, collapse = ","))
+numeric_vector <- unlist(lapply(strsplit(appended_vector, ","), as.numeric))
+
+production_planning_horizon <- production %>%
+  filter(datetime >= test_horizon_start & test_horizon_end >= datetime)
+
+print(accu(production_planning_horizon$production, head(numeric_vector, length(numeric_vector)-48)))
+```
+
+```{r}
+tomorrow <- as.Date("2024-05-26", format = "%Y-%m-%d")
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  filter(date == tomorrow)
+
+test_horizon_forecasts
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  select(-date)
+
+print(sum(test_horizon_forecasts))
+```
+
+```{r}
+test_horizon_forecasts <- data.frame(
+  date = as.Date(production_sma_hour4$datetime),
+  hour_0 = zero_vector,
+  hour_1 = zero_vector,
+  hour_2 = zero_vector,
+  hour_3 = zero_vector,
+  hour_4 = production_sma_hour4$sma_forecasts,
+  hour_5 = production_sma_hour5$sma_forecasts,
+  hour_6 = results_cluster_3$V1,
+  hour_7 = results_cluster_3$V2,
+  hour_8 = results_cluster_3$V3,
+  hour_9 = results_hour_9,
+  hour_10 = results_hour_10,
+  hour_11 = results_hour_11,
+  hour_12 = results_hour_12,
+  hour_13 = results_hour_13,
+  hour_14 = results_hour_14,
+  hour_15 = results_cluster_3$V4,
+  hour_16 = results_cluster_3$V5,
+  hour_17 = results_cluster_3$V6,
+  hour_18 = production_sma_hour18$sma_forecasts,
+  hour_19 = zero_vector,
+  hour_20 = zero_vector,
+  hour_21 = zero_vector,
+  hour_22 = zero_vector,
+  hour_23 = zero_vector
+)
+
+test_horizon_forecasts
+
+write.xlsx(test_horizon_forecasts, "model1_forecasts.xlsx")
+```
+
+```{r}
+test_horizon_forecasts_eval <- test_horizon_forecasts %>%
+  select(-date)
+
+appended_vector <- apply(test_horizon_forecasts_eval, 1, function(row) paste(row, collapse = ","))
+numeric_vector <- unlist(lapply(strsplit(appended_vector, ","), as.numeric))
+
+production_planning_horizon <- production %>%
+  filter(datetime >= test_horizon_start & test_horizon_end >= datetime)
+
+print(accu(production_planning_horizon$production, head(numeric_vector, length(numeric_vector)-48)))
+```
+
+```{r}
+tomorrow <- as.Date("2024-05-26", format = "%Y-%m-%d")
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  filter(date == tomorrow)
+
+test_horizon_forecasts
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  select(-date)
+
+print(sum(test_horizon_forecasts))
+```
+
+```{r}
+results_hour_6[results_hour_6 < 0] <- 0
+results_hour_7[results_hour_7 < 0] <- 0
+results_hour_8[results_hour_8 < 0] <- 0
+results_hour_9[results_hour_9 < 0] <- 0
+results_hour_10[results_hour_10 < 0] <- 0
+results_hour_11[results_hour_11 < 0] <- 0
+results_hour_12[results_hour_12 < 0] <- 0
+results_hour_13[results_hour_13 < 0] <- 0
+results_hour_14[results_hour_14 < 0] <- 0
+results_hour_15[results_hour_15 < 0] <- 0
+results_hour_16[results_hour_16 < 0] <- 0
+results_hour_17[results_hour_17 < 0] <- 0
+
+results_hour_6[results_hour_6 > 10] <- 10
+results_hour_7[results_hour_7 > 10] <- 10
+results_hour_8[results_hour_8 > 10] <- 10
+results_hour_9[results_hour_9 > 10] <- 10
+results_hour_10[results_hour_10 > 10] <- 10
+results_hour_11[results_hour_11 > 10] <- 10
+results_hour_12[results_hour_12 > 10] <- 10
+results_hour_13[results_hour_13 > 10] <- 10
+results_hour_14[results_hour_14 > 10] <- 10
+results_hour_15[results_hour_15 > 10] <- 10
+results_hour_16[results_hour_16 > 10] <- 10
+results_hour_17[results_hour_17 > 10] <- 10
+```
+
+```{r}
+test_horizon_forecasts <- data.frame(
+  date = as.Date(production_sma_hour4$datetime),
+  hour_0 = zero_vector,
+  hour_1 = zero_vector,
+  hour_2 = zero_vector,
+  hour_3 = zero_vector,
+  hour_4 = production_sma_hour4$sma_forecasts,
+  hour_5 = production_sma_hour5$sma_forecasts,
+  hour_6 = results_hour_6,
+  hour_7 = results_hour_7,
+  hour_8 = results_hour_8,
+  hour_9 = results_hour_9,
+  hour_10 = results_hour_10,
+  hour_11 = results_hour_11,
+  hour_12 = results_hour_12,
+  hour_13 = results_hour_13,
+  hour_14 = results_hour_14,
+  hour_15 = results_hour_15,
+  hour_16 = results_hour_16,
+  hour_17 = results_hour_17,
+  hour_18 = production_sma_hour18$sma_forecasts,
+  hour_19 = zero_vector,
+  hour_20 = zero_vector,
+  hour_21 = zero_vector,
+  hour_22 = zero_vector,
+  hour_23 = zero_vector
+)
+
+test_horizon_forecasts
+```
+
+```{r}
+test_horizon_forecasts_eval <- test_horizon_forecasts %>%
+  select(-date)
+
+appended_vector <- apply(test_horizon_forecasts_eval, 1, function(row) paste(row, collapse = ","))
+numeric_vector <- unlist(lapply(strsplit(appended_vector, ","), as.numeric))
+
+production_planning_horizon <- production %>%
+  filter(datetime >= test_horizon_start & test_horizon_end >= datetime)
+
+print(accu(production_planning_horizon$production, head(numeric_vector, length(numeric_vector)-48)))
+```
+
+```{r}
+tomorrow <- as.Date("2024-05-26", format = "%Y-%m-%d")
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  filter(date == tomorrow)
+
+test_horizon_forecasts
+
+test_horizon_forecasts <- test_horizon_forecasts %>%
+  select(-date)
+
+print(sum(test_horizon_forecasts))
+```
+
+0,0,0,0,0,0.2,0.6518538,4.509559,7.031491,8.338677,8.345236,8.078314,8.103152,8.287001,7.32275,5.79955,3.120752,1.542959,0,0,0,0,0,0
+
+0,0,0,0,0,0.24,1.5741,3.2313,4.945249,5.331174,5.438502,4.901593,5.363469,4.485145,5.008742,5.357119,3.783997,1.65582,0,0,0,0,0,0
+
+0,0,0,0,0.03,0.25,1.35411,4.42199,6.73355,7.021134,5.298522,5.6983,6.63233,5.646008,3.894142,3.033961,2.300915,1.286645,0.07666667,0,0,0,0,0
+
+0,0,0,0,0,0.28,1.694,4.656,8.846,8.634212,9.218345,9.109087,8.83453,9.163619,8.090401,7.315,3.241,1.156,0.023,0,0,0,0,0
+
+0,0,0,0,0,0.28,1.694,4.656,8.846,8.162,9.068,8.84,8.632,8.953,7.905,7.315,3.241,1.156,0.023,0,0,0,0,0
+
+0,0,0,0,0.05,0.7266667,1.8797032,4.932809,9.745921,9.675887,9.625419,9.512292,9.200621,8.90983,8.492263,8.168962,3.726439,1.084359,0.06666667,0,0,0,0,0
+
+0,0,0,0,0.0133333,0.2,0.5773346,3.040435,7.356494,8.667891,8.152845,7.274486,6.896745,6.317868,6.185135,6.083065,2.4456,0.7116465,0.0533333,0,0,0,0,0
+
+0,0,0,0,0.02,0.1,0.5799,3.054222,7.38985,8.677,9.385368,9.401537,9.0911,7.678289,6.56637,6.1106489,2.45668952,0.714873,0.05333,0,0,0,0,0
+
+0,0,0,0,0.026666,0.28,0.68817778,3.6241724,8.768876,7.918282,7.651431,6.937392,7.204389,7.110302,6.018200,7.250961,2.9151337,0.8482764,0.0933333,0,0,0,0,0
+
+K8LxUY39LVnR7DU4AVfvHuFLL7PDP0nAl6yq5JOr89hapGC1Zw
+
+0,0,0,0,0.01,0.25,0.24,0.98,2.03,2.51,5.02,5.42,5.61,5.52,5.14,5.53,3.64,2.25,0.05,0,0,0,0,0
+
+0,0,0,0,0.01667,0.21,0.7355023,2.873399,3.371894,5.592984,5.971369,6.030148,6.089912,5.690177,4.809208,3.749594,1.415601,0.7066107,0.0167,0,0,0,0,0
+
+0.163615062, 0.174684177, 0.176403689, 0.178151998, 0.166458302, 0.140686771
+
+0.028560312, 0.150408073, 0.363920275, 0.300924708, 0.120982008, 0.035204624
+
+
+
